@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=45", "wheel", "setuptools_scm[toml]>=6.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "graphavalanche"
+version = "0.1.0"
+description = "Citation network visualization tool for academic papers"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [{name = "Your Name", email = "your.email@example.com"}]
+keywords = ["citation", "network", "visualization", "academic", "papers"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+]
+dependencies = [
+    "pandas>=1.3.0",
+    "networkx>=2.6",
+    "plotly>=5.0",
+    "streamlit>=1.10",
+    "requests>=2.26",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=6.0", "black", "flake8", "mypy"]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/GRAPHAVALANCHE"
+Documentation = "https://github.com/yourusername/GRAPHAVALANCHE#readme"
+Repository = "https://github.com/yourusername/GRAPHAVALANCHE.git"
+Issues = "https://github.com/yourusername/GRAPHAVALANCHE/issues"
