@@ -4,6 +4,7 @@ Works with any Excel output from AVALANCHE literature discovery tool
 """
 
 import streamlit as st
+import streamlit.components.v1 as components
 import networkx as nx
 import plotly.graph_objects as go
 import pandas as pd
@@ -100,6 +101,54 @@ def assign_tier(cited_by: int, t1: int, t2: int, t3: int) -> str:
         return 'Other'
 
 
+def calculate_proportional_sizes(cited_by_series: pd.Series, min_size: int = 15, max_size: int = 60) -> pd.Series:
+    """Calculate node sizes proportional to citation counts."""
+    min_citations = cited_by_series.min()
+    max_citations = cited_by_series.max()
+
+    if max_citations == min_citations:
+        # All same citations, use middle size
+        return pd.Series([( min_size + max_size) // 2] * len(cited_by_series), index=cited_by_series.index)
+
+    # Linear scaling between min_size and max_size
+    sizes = min_size + (cited_by_series - min_citations) / (max_citations - min_citations) * (max_size - min_size)
+    return sizes.astype(int)
+
+
+def extract_first_author_label(authors_str: str) -> str:
+    """Extract 'First Author et al.' from authors string. Returns empty string if unknown."""
+    if pd.isna(authors_str) or not authors_str or authors_str == 'Unknown':
+        return ''  # Return empty instead of 'Unknown'
+
+    authors_str = str(authors_str).strip()
+
+    # Handle different separators
+    if ';' in authors_str:
+        authors = authors_str.split(';')
+    elif ',' in authors_str and authors_str.count(',') > 1:
+        # Multiple commas likely means multiple authors
+        authors = authors_str.split(',')
+    else:
+        authors = [authors_str]
+
+    first_author = authors[0].strip()
+
+    # Extract last name (handle "Last, First" or "First Last" formats)
+    if ',' in first_author:
+        last_name = first_author.split(',')[0].strip()
+    else:
+        parts = first_author.split()
+        last_name = parts[-1] if parts else first_author
+
+    # Truncate if too long
+    if len(last_name) > 12:
+        last_name = last_name[:10] + '..'
+
+    if len(authors) > 1:
+        return f"{last_name} et al."
+    return last_name
+
+
 def prepare_avalanche_data(df: pd.DataFrame, t1: int, t2: int, t3: int) -> pd.DataFrame:
     """Prepare AVALANCHE data for visualization."""
 
@@ -118,13 +167,22 @@ def prepare_avalanche_data(df: pd.DataFrame, t1: int, t2: int, t3: int) -> pd.Da
     # Assign tiers
     df['Tier'] = df['Cited_By'].apply(lambda x: assign_tier(x, t1, t2, t3))
 
-    # Add colors and sizes
+    # Add colors (keep tier-based)
     df['Color'] = df['Tier'].map(tier_colors)
-    df['Size'] = df['Tier'].map(tier_sizes)
+
+    # Calculate sizes proportional to citations
+    df['Size'] = calculate_proportional_sizes(df['Cited_By'])
 
     # Handle optional Year column
     if 'Year' not in df.columns:
         df['Year'] = 0
+
+    # Handle Authors column - will be populated from OpenAlex if not present
+    if 'Authors' not in df.columns:
+        df['Authors'] = 'Unknown'
+
+    # Create author label for display
+    df['AuthorLabel'] = df['Authors'].apply(extract_first_author_label)
 
     # Create short title for labels
     df['ShortTitle'] = df['Title'].apply(lambda x: str(x)[:40] + '...' if len(str(x)) > 40 else str(x))
@@ -133,8 +191,8 @@ def prepare_avalanche_data(df: pd.DataFrame, t1: int, t2: int, t3: int) -> pd.Da
 
 
 @st.cache_data
-def fetch_citation_data(papers_df: pd.DataFrame, batch_size: int = 50) -> Tuple[Dict, Dict]:
-    """Fetch citation relationships from OpenAlex."""
+def fetch_citation_data(papers_df: pd.DataFrame, batch_size: int = 50) -> Tuple[Dict, Dict, Dict]:
+    """Fetch citation relationships and author data from OpenAlex."""
 
     # Build DOI index
     doi_to_id = {}
@@ -145,6 +203,7 @@ def fetch_citation_data(papers_df: pd.DataFrame, batch_size: int = 50) -> Tuple[
 
     all_dois = list(doi_to_id.keys())
     doi_to_references = {}
+    doi_to_authors = {}  # New: store authors for each paper
 
     # Progress tracking
     progress_bar = st.progress(0)
@@ -172,6 +231,18 @@ def fetch_citation_data(papers_df: pd.DataFrame, batch_size: int = 50) -> Tuple[
                     if rec_doi:
                         norm_doi = normalize_doi(rec_doi)
                         doi_to_references[norm_doi] = rec.get('referenced_works', [])
+                        # Extract authors
+                        authorships = rec.get('authorships', [])
+                        if authorships:
+                            author_names = []
+                            for auth in authorships:
+                                author_info = auth.get('author', {})
+                                name = author_info.get('display_name', '')
+                                if name:
+                                    author_names.append(name)
+                            doi_to_authors[norm_doi] = '; '.join(author_names) if author_names else 'Unknown'
+                        else:
+                            doi_to_authors[norm_doi] = 'Unknown'
             time.sleep(1)  # Rate limiting
         except Exception as e:
             st.warning(f"Error fetching batch {batch_num}: {e}")
@@ -213,24 +284,31 @@ def fetch_citation_data(papers_df: pd.DataFrame, batch_size: int = 50) -> Tuple[
     progress_bar.empty()
     status_text.empty()
 
-    return doi_to_references, openalex_id_to_doi
+    return doi_to_references, openalex_id_to_doi, doi_to_authors
 
 
-def build_citation_network(papers_df: pd.DataFrame, doi_to_references: Dict, openalex_id_to_doi: Dict) -> nx.DiGraph:
+def build_citation_network(papers_df: pd.DataFrame, doi_to_references: Dict, openalex_id_to_doi: Dict, doi_to_authors: Dict) -> nx.DiGraph:
     """Build NetworkX directed graph from citation data."""
 
-    # Build DOI to ID mapping
+    # Build DOI to ID mapping and ID to DOI
     doi_to_id = {}
+    id_to_doi = {}
     for _, row in papers_df.iterrows():
         doi = normalize_doi(row.get('DOI'))
         if doi:
             doi_to_id[doi] = row['ID']
+            id_to_doi[row['ID']] = doi
 
     # Create graph
     G = nx.DiGraph()
 
-    # Add nodes with attributes
+    # Add nodes with attributes (initial, sizes will be recalculated)
     for _, row in papers_df.iterrows():
+        doi = normalize_doi(row.get('DOI'))
+        # Get authors from OpenAlex data
+        authors = doi_to_authors.get(doi, row.get('Authors', 'Unknown'))
+        author_label = extract_first_author_label(authors)
+
         G.add_node(
             row['ID'],
             title=row['Title'],
@@ -238,9 +316,11 @@ def build_citation_network(papers_df: pd.DataFrame, doi_to_references: Dict, ope
             cited_by=row['Cited_By'],
             tier=row['Tier'],
             color=row['Color'],
-            size=row['Size'],
+            size=row['Size'],  # Will be recalculated based on internal citations
             venue=row.get('Venue', ''),
-            doi=row.get('DOI', '')
+            doi=row.get('DOI', ''),
+            authors=authors,
+            author_label=author_label
         )
 
     # Add edges (citations)
@@ -256,6 +336,22 @@ def build_citation_network(papers_df: pd.DataFrame, doi_to_references: Dict, ope
                 tgt_id = doi_to_id[tgt_doi]
                 G.add_edge(src_id, tgt_id)
                 edge_count += 1
+
+    # Recalculate sizes based on internal citations (in-degree within the network)
+    in_degrees = dict(G.in_degree())
+    if in_degrees:
+        min_deg = min(in_degrees.values())
+        max_deg = max(in_degrees.values())
+        min_size, max_size = 15, 60
+
+        for node_id in G.nodes():
+            deg = in_degrees.get(node_id, 0)
+            if max_deg == min_deg:
+                new_size = (min_size + max_size) // 2
+            else:
+                new_size = int(min_size + (deg - min_deg) / (max_deg - min_deg) * (max_size - min_size))
+            G.nodes[node_id]['size'] = new_size
+            G.nodes[node_id]['internal_citations'] = deg
 
     return G
 
@@ -306,27 +402,49 @@ def create_network_visualization(G: nx.DiGraph, layout_algo: str, show_labels: b
         colors = [G.nodes[n]['color'] for n in tier_nodes]
         sizes = [G.nodes[n]['size'] for n in tier_nodes]
 
-        # Create hover text
+        # Create hover text and DOI URLs
         hover_text = []
+        doi_urls = []
         for n in tier_nodes:
             node = G.nodes[n]
+            authors_display = node.get('authors', '')
+            if authors_display and authors_display != 'Unknown':
+                authors_display = authors_display[:50] + '...'
+            else:
+                authors_display = ''
+
             text = f"<b>{node['title'][:60]}...</b><br>"
+            if authors_display:
+                text += f"Author: {authors_display}<br>"
             text += f"Year: {node['year']}<br>"
-            text += f"Citations: {node['cited_by']}<br>"
+            text += f"Citations (total): {node['cited_by']}<br>"
+            text += f"Citations (in network): {node.get('internal_citations', 0)}<br>"
             text += f"Tier: {node['tier']}<br>"
-            text += f"Venue: {str(node['venue'])[:50]}"
+            text += f"Venue: {str(node['venue'])[:50]}<br>"
+            text += f"<i>Click to open article</i>"
             hover_text.append(text)
 
-        # Labels
-        labels = [G.nodes[n]['title'][:20] + '...' for n in tier_nodes] if show_labels else None
+            # Build DOI URL
+            doi = node.get('doi', '')
+            if doi and not pd.isna(doi):
+                doi_str = str(doi)
+                doi_url = f"https://doi.org/{normalize_doi(doi_str)}" if not doi_str.startswith('http') else doi_str
+            else:
+                doi_url = ''
+            doi_urls.append(doi_url)
+
+        # Always show author labels on nodes (empty string if unknown)
+        author_labels = [G.nodes[n].get('author_label', '') for n in tier_nodes]
 
         node_trace = go.Scatter(
             x=x_vals, y=y_vals,
-            mode='markers+text' if show_labels else 'markers',
-            text=labels,
+            mode='markers+text',  # Always show text labels
+            text=author_labels,
             textposition="top center",
+            textfont=dict(size=9, color='#333333'),
             hovertext=hover_text,
             hoverinfo='text',
+            customdata=doi_urls,  # Store DOI URLs for click handling
             marker=dict(
                 size=sizes,
                 color=colors,
@@ -341,54 +459,238 @@ def create_network_visualization(G: nx.DiGraph, layout_algo: str, show_labels: b
     fig = go.Figure(
         data=[edge_trace] + tier_traces,
         layout=go.Layout(
-            title=dict(text="Citation Network (Directed Graph)", font=dict(size=16)),
+            title=dict(text="Citation Network (Click nodes to open articles)", font=dict(size=16)),
             showlegend=True,
             hovermode='closest',
             margin=dict(b=20, l=5, r=5, t=40),
             xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
             yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
             plot_bgcolor='rgba(240,240,240,0.5)',
-            height=700
+            height=700,
+            clickmode='event'
         )
     )
 
-    return fig
+    return fig, G  # Return graph for click handling
 
 
-def create_timeline_visualization(papers_df: pd.DataFrame):
-    """Create timeline view of papers."""
-    df_sorted = papers_df.sort_values('Year')
+def create_timeline_visualization(papers_df: pd.DataFrame, G: nx.DiGraph = None):
+    """Create horizontal timeline view similar to research milestone timelines.
+    Papers alternate above/below the timeline axis with connecting lines.
+    Optimized for better spacing and readability.
+    """
+    df_sorted = papers_df.sort_values('Year').copy()
+
+    # If we have graph data, use internal citation counts for sizing and get author labels
+    if G is not None:
+        node_data = {n: G.nodes[n] for n in G.nodes()}
+        new_sizes = []
+        author_labels = []
+        doi_urls = []
+        for _, row in df_sorted.iterrows():
+            paper_id = row['ID']
+            if paper_id in node_data:
+                new_sizes.append(node_data[paper_id].get('size', row['Size']))
+                label = node_data[paper_id].get('author_label', '')
+                author_labels.append(label if label != 'Unknown' else '')
+            else:
+                new_sizes.append(row['Size'])
+                label = row.get('AuthorLabel', '')
+                author_labels.append(label if label != 'Unknown' else '')
+
+            # Build DOI URL
+            doi = row.get('DOI', '')
+            if doi and not pd.isna(doi):
+                doi_str = str(doi)
+                doi_url = f"https://doi.org/{normalize_doi(doi_str)}" if not doi_str.startswith('http') else doi_str
+            else:
+                doi_url = ''
+            doi_urls.append(doi_url)
+
+        df_sorted['Size'] = new_sizes
+        df_sorted['AuthorLabel'] = author_labels
+        df_sorted['DOI_URL'] = doi_urls
 
     fig = go.Figure()
 
-    # Add traces by tier
+    # Get unique years and create positions with more horizontal spacing
+    years = sorted(df_sorted['Year'].unique())
+    # Increase horizontal spacing between years
+    x_spacing = 2.0  # Multiply x positions for more horizontal space
+    year_to_x = {year: i * x_spacing for i, year in enumerate(years)}
+
+    # Assign alternating positions (above/below) for papers in each year
+    df_sorted['x_pos'] = df_sorted['Year'].map(year_to_x)
+
+    # Group by year and assign y positions with MUCH MORE vertical spacing
+    # Use staggered positions to avoid overlap
+    y_positions = []
+    x_offsets = []  # Small horizontal offsets to spread papers within same year
+    y_counter = {}
+
+    # Vertical spacing multiplier - increase this for more space between circles
+    vertical_spacing = 1.8
+
+    for idx, (_, row) in enumerate(df_sorted.iterrows()):
+        year = row['Year']
+        if year not in y_counter:
+            y_counter[year] = {'above': 0, 'below': 0, 'next': 'above'}
+
+        if y_counter[year]['next'] == 'above':
+            y_counter[year]['above'] += 1
+            y_pos = y_counter[year]['above'] * vertical_spacing
+            y_counter[year]['next'] = 'below'
+        else:
+            y_counter[year]['below'] += 1
+            y_pos = -y_counter[year]['below'] * vertical_spacing
+            y_counter[year]['next'] = 'above'
+
+        y_positions.append(y_pos)
+
+        # Add small horizontal offset for papers in same year to reduce overlap
+        papers_in_year = y_counter[year]['above'] + y_counter[year]['below']
+        x_offset = (papers_in_year % 3 - 1) * 0.15  # Slight left/center/right variation
+        x_offsets.append(x_offset)
+
+    df_sorted['y_pos'] = y_positions
+    df_sorted['x_offset'] = x_offsets
+
+    # Draw the main timeline axis (horizontal line at y=0)
+    fig.add_trace(go.Scatter(
+        x=[i * x_spacing for i in range(len(years))],
+        y=[0] * len(years),
+        mode='lines+markers',
+        line=dict(color='#444444', width=4),
+        marker=dict(size=10, color='#444444', symbol='diamond'),
+        hoverinfo='skip',
+        showlegend=False
+    ))
+
+    # Add year labels on the timeline
+    for i, year in enumerate(years):
+        fig.add_annotation(
+            x=i * x_spacing, y=0,
+            text=f"<b>{year}</b>",
+            showarrow=False,
+            yshift=-30,
+            font=dict(size=10, color='#333333', family='Arial')
+        )
+
+    # Draw connecting lines from timeline to each paper bubble
+    for _, row in df_sorted.iterrows():
+        x_with_offset = row['x_pos'] + row['x_offset']
+        fig.add_trace(go.Scatter(
+            x=[row['x_pos'], x_with_offset],
+            y=[0, row['y_pos']],
+            mode='lines',
+            line=dict(color=row['Color'], width=2, dash='dot'),
+            hoverinfo='skip',
+            showlegend=False
+        ))
+
+    # Add paper bubbles by tier (for legend grouping)
     for tier in ['Tier 1', 'Tier 2', 'Tier 3', 'Other']:
         tier_df = df_sorted[df_sorted['Tier'] == tier]
         if len(tier_df) == 0:
             continue
 
+        # Use y_pos directly (already has proper spacing)
+        y_vals = tier_df['y_pos'].tolist()
+        # Apply x offsets
+        x_vals = (tier_df['x_pos'] + tier_df['x_offset']).tolist()
+
+        # Build hover text and labels
+        hover_texts = []
+        labels = []
+        doi_urls = []
+        for _, row in tier_df.iterrows():
+            author = row.get('AuthorLabel', '')
+
+            # Create cleaner label: just "Author et al." on one line
+            if author:
+                label = f"{author}"
+            else:
+                # Use very short title if no author
+                title_short = str(row['Title'])[:15] + '...'
+                label = title_short
+            labels.append(label)
+
+            # Hover text with full details
+            hover = f"<b>{row['Title'][:80]}...</b><br>"
+            if author:
+                hover += f"Author: {author}<br>"
+            hover += f"Year: {row['Year']}<br>"
+            hover += f"Citations: {row['Cited_By']}<br>"
+            hover += f"Tier: {row['Tier']}<br>"
+            hover += f"<i>Click to open article</i>"
+            hover_texts.append(hover)
+
+            doi_urls.append(row.get('DOI_URL', ''))
+
+        # Determine text positions based on y values
+        text_positions = []
+        for y in y_vals:
+            if y > 0:
+                text_positions.append('top center')
+            else:
+                text_positions.append('bottom center')
+
         fig.add_trace(go.Scatter(
-            x=tier_df['Year'],
-            y=tier_df['Cited_By'],
-            mode='markers',
+            x=x_vals,
+            y=y_vals,
+            mode='markers+text',
             marker=dict(
                 size=tier_df['Size'],
                 color=tier_df['Color'],
-                line=dict(width=1, color='white'),
-                opacity=0.8
+                line=dict(width=2, color='white'),
+                opacity=0.9
             ),
-            text=tier_df['Title'].apply(lambda x: str(x)[:50] + '...'),
-            hovertemplate='<b>%{text}</b><br>Year: %{x}<br>Citations: %{y}<extra></extra>',
+            text=labels,
+            textposition=text_positions,
+            textfont=dict(size=9, color='#333333', family='Arial'),
+            hovertext=hover_texts,
+            hoverinfo='text',
+            customdata=doi_urls,
             name=tier
         ))
 
+    # Calculate axis ranges with padding
+    max_x = max(year_to_x.values()) if year_to_x else 1
+    max_y = max(abs(min(y_positions)), abs(max(y_positions))) if y_positions else 1
+
+    # Update layout for horizontal timeline appearance
     fig.update_layout(
-        title="Timeline: Papers by Year and Citation Count",
-        xaxis_title="Publication Year",
-        yaxis_title="Citation Count",
+        title=dict(
+            text="Research Timeline (Click bubbles to open articles)",
+            font=dict(size=16, family='Arial')
+        ),
+        xaxis=dict(
+            showgrid=False,
+            zeroline=False,
+            showticklabels=False,
+            range=[-1, max_x + 1]
+        ),
+        yaxis=dict(
+            showgrid=False,
+            zeroline=False,
+            showticklabels=False,
+            range=[-(max_y + 1.5), max_y + 1.5]
+        ),
+        plot_bgcolor='#fafafa',
+        paper_bgcolor='white',
+        height=800,  # Taller for better spacing
+        showlegend=True,
+        legend=dict(
+            orientation='h',
+            yanchor='bottom',
+            y=1.02,
+            xanchor='center',
+            x=0.5,
+            font=dict(size=11)
+        ),
         hovermode='closest',
-        height=400,
-        showlegend=True
+        clickmode='event',
+        margin=dict(l=20, r=20, t=60, b=60)
     )
 
     return fig
@@ -420,14 +722,14 @@ if uploaded_file is not None:
 
             # Fetch citation data
             if st.button("🔄 Fetch Citation Network (may take 2-3 minutes)"):
-                with st.spinner("Fetching citation relationships from OpenAlex..."):
-                    doi_to_refs, oa_id_to_doi = fetch_citation_data(df_prepared)
+                with st.spinner("Fetching citation relationships and author data from OpenAlex..."):
+                    doi_to_refs, oa_id_to_doi, doi_to_authors = fetch_citation_data(df_prepared)
 
                 st.success(f"✅ Fetched citation data for {len(doi_to_refs)} papers")
 
                 # Build network
                 with st.spinner("Building citation network..."):
-                    G = build_citation_network(df_prepared, doi_to_refs, oa_id_to_doi)
+                    G = build_citation_network(df_prepared, doi_to_refs, oa_id_to_doi, doi_to_authors)
 
                 st.success(f"✅ Network built: {len(G.nodes())} nodes, {len(G.edges())} edges")
 
@@ -463,15 +765,46 @@ if uploaded_file is not None:
 
                 # Create visualization
                 with st.spinner("Rendering network visualization..."):
-                    fig_network = create_network_visualization(G, layout_algorithm, show_labels, edge_opacity)
-                st.plotly_chart(fig_network, width='stretch')
+                    fig_network, _ = create_network_visualization(G, layout_algorithm, show_labels, edge_opacity)
+
+                # Add JavaScript for click handling to open DOI links
+                st.markdown("""
+                <script>
+                document.addEventListener('plotly_click', function(data) {
+                    if (data.points && data.points[0] && data.points[0].customdata) {
+                        var url = data.points[0].customdata;
+                        if (url) window.open(url, '_blank');
+                    }
+                });
+                </script>
+                """, unsafe_allow_html=True)
+
+                # Display network chart with click events
+                selected_point = st.plotly_chart(fig_network, use_container_width=True, on_select="rerun", key="network_chart")
+
+                # Handle click events for network
+                if selected_point and 'selection' in selected_point and selected_point['selection'].get('points'):
+                    point = selected_point['selection']['points'][0]
+                    if 'customdata' in point and point['customdata']:
+                        doi_url = point['customdata']
+                        st.markdown(f"**Selected paper:** [Open in browser]({doi_url})")
+                        st.components.v1.html(f'<script>window.open("{doi_url}", "_blank");</script>', height=0)
 
                 # Timeline view
                 if show_timeline:
                     st.markdown("---")
                     st.header("📅 Timeline View")
-                    fig_timeline = create_timeline_visualization(df_viz)
-                    st.plotly_chart(fig_timeline, width='stretch')
+                    fig_timeline = create_timeline_visualization(df_viz, G)
+
+                    selected_timeline = st.plotly_chart(fig_timeline, use_container_width=True, on_select="rerun", key="timeline_chart")
+
+                    # Handle click events for timeline
+                    if selected_timeline and 'selection' in selected_timeline and selected_timeline['selection'].get('points'):
+                        point = selected_timeline['selection']['points'][0]
+                        if 'customdata' in point and point['customdata']:
+                            doi_url = point['customdata']
+                            st.markdown(f"**Selected paper:** [Open in browser]({doi_url})")
+                            st.components.v1.html(f'<script>window.open("{doi_url}", "_blank");</script>', height=0)
 
                 # Export options
                 st.markdown("---")
