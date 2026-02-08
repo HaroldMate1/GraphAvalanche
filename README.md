@@ -46,17 +46,9 @@ pip install -r requirements.txt
 
 ### Run the App
 
-```bash
-streamlit run app_v2.py
-```
+python -m streamlit --version
+python -m streamlit run app_v2.py
 
-The app will open in your browser at `http://localhost:8501`
-
-### Or use the original version (for pre-processed data)
-
-```bash
-streamlit run app.py
-```
 
 ---
 
